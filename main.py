@@ -1,92 +1,103 @@
-# main.py
-
 import argparse
 import os
 import torch
-from torch.utils.data import DataLoader
-
-# 你的模块路径，根据项目实际路径导入
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
 from bearing_dataset import BearingDataset
-from models.multitask_model import MultiTaskModel
-from training.train import train
-from training.evaluate import evaluate_model
-import logging
-
-logging.basicConfig(filename='training.log', level=logging.INFO)
+from models import MultiTaskModel
+from training import train, evaluate_model
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train and evaluate multi-task Transformer on CWRU data")
-    # 数据和模型配置
-    p.add_argument("--data_dir",     type=str, default="dataset/Data", help="Path to .npz files")
-    p.add_argument("--batch_size",   type=int, default=32)
-    p.add_argument("--lr",           type=float, default=1e-4)
-    p.add_argument("--epochs",       type=int, default=100)
-    p.add_argument("--patience",     type=int, default=10)
-    p.add_argument("--sched_patience", type=int, default=5)
-    p.add_argument("--out_dir",      type=str, default="outputs", help="Where to save models and logs")
-    # 模型超参
-    p.add_argument("--embed_dim",    type=int, default=128)
-    p.add_argument("--heads",        type=int, default=8)
-    p.add_argument("--layers",       type=int, default=4)
-    p.add_argument("--kernel_sizes", type=int, nargs="+", default=[3,5,9])
-    return p.parse_args()
+    """
+    解析命令行参数。
+    :return: 解析后的参数
+    """
+    parser = argparse.ArgumentParser(description='Train a multi-task Transformer model on bearing data.')
+    parser.add_argument('--data_dir', type=str, default='dataset/Data/matfiles', help='数据目录')
+    parser.add_argument('--out_dir', type=str, default='output', help='输出目录')
+    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
+    parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
+    parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
+    parser.add_argument('--patience', type=int, default=10, help='早停耐心值')
+    parser.add_argument('--scheduler_patience', type=int, default=5, help='学习率调度耐心值')
+    parser.add_argument('--weight_decay', type=float, default=0, help='权重衰减')
+    return parser.parse_args()
 
 def main():
+    """
+    主函数，执行数据加载、模型训练和评估。
+    """
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # 1. 数据加载
-    # 构造文件列表（此处只示例 1797 RPM 四类文件，按需扩展）
+    # 加载数据集
     files = [
-        os.path.join(args.data_dir, "1797_Normal.npz"),
-        os.path.join(args.data_dir, "1797_IR_21_DE12.npz"),
-        os.path.join(args.data_dir, "1797_B_14_DE12.npz"),
-        os.path.join(args.data_dir, "1797_OR@12_21_DE12.npz"),
+        f'{args.data_dir}/0_0.mat',
+        f'{args.data_dir}/7_1.mat',
+        f'{args.data_dir}/7_2.mat',
+        f'{args.data_dir}/7_3.mat',
+        f'{args.data_dir}/14_1.mat',
+        f'{args.data_dir}/14_2.mat',
+        f'{args.data_dir}/14_3.mat',
+        f'{args.data_dir}/21_1.mat',
+        f'{args.data_dir}/21_2.mat',
+        f'{args.data_dir}/21_3.mat',
     ]
-    # Dataset 返回 (X_hist, Y_pred, y_cls)
-    dataset = BearingDataset(file_names=files,
-                             Lhist=1024, Lpred=150, step=512)
-    # 划分训练/验证
-    total = len(dataset)
-    n_train = int(0.8 * total)
-    n_val   = total - n_train
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+    dataset = BearingDataset(files, Lhist=1024, Lpred=1024, step=512)
+    X, Y_pred, y, file_indices = dataset.load_data()
 
-    # 2. 模型构建
+    # 分层划分数据集
+    train_idx, temp_idx = train_test_split(
+        np.arange(len(X)),
+        test_size=0.4,  # 40% 用于验证+测试
+        stratify=file_indices,
+        random_state=42
+    )
+    val_idx, test_idx = train_test_split(
+        temp_idx,
+        test_size=0.5,  # 临时集的一半，即20%
+        stratify=file_indices[temp_idx],
+        random_state=42
+    )
+
+    # 创建子集
+    train_X, train_Y_pred, train_y = X[train_idx], Y_pred[train_idx], y[train_idx]
+    val_X, val_Y_pred, val_y = X[val_idx], Y_pred[val_idx], y[val_idx]
+    test_X, test_Y_pred, test_y = X[test_idx], Y_pred[test_idx], y[test_idx]
+
+    # 转换为 TensorDataset
+    train_dataset = TensorDataset(
+        torch.from_numpy(train_X).float().unsqueeze(1),
+        torch.from_numpy(train_y).long(),
+        torch.from_numpy(train_Y_pred).float()
+    )
+    val_dataset = TensorDataset(
+        torch.from_numpy(val_X).float().unsqueeze(1),
+        torch.from_numpy(val_y).long(),
+        torch.from_numpy(val_Y_pred).float()
+    )
+    test_dataset = TensorDataset(
+        torch.from_numpy(test_X).float().unsqueeze(1),
+        torch.from_numpy(test_y).long(),
+        torch.from_numpy(test_Y_pred).float()
+    )
+
+    # 创建 DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+
+    # 构建模型
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MultiTaskModel(
         in_channels=1,
-        embed_dim=args.embed_dim,
-        kernel_sizes=tuple(args.kernel_sizes),
-        num_layers=args.layers,
-        num_heads=args.heads
-    )
-
-    # 3. 训练
-    best_model_path, history = train(
-        train_loader, val_loader, model,
-        num_epochs=args.epochs,
-        learning_rate=args.lr,
-        patience=args.patience,
-        scheduler_patience=args.sched_patience,
-        weight_decay=0
-    )
-    print(f"Best model saved to: {best_model_path}")
-
-    # 4. 最终评估
-    # 重新加载最佳权重
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-    eval_results = evaluate_model(model, val_loader, device, log_dir=args.out_dir)
-    print("Final evaluation on validation set:")
-    for k, v in eval_results.items():
-        print(f"  {k}: {v:.4f}")
-
-    # 5. 可选：保存训练历史到文件
-    import json
-    with open(os.path.join(args.out_dir, "train_history.json"), "w") as f:
-        json.dump(history, f, indent=2)
-
-if __name__ == "__main__":
-    main()
+        embed_dim=128,
+        kernel_sizes=(3, 5, 9),
+        num_layers=4,
+        num_heads=8,
+        dim_feedforward=256,
+        local_window_size=5
+    ).to(device)
+    print("模型结构:", model)
+    
