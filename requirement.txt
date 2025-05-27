@@ -1,0 +1,4 @@
+matplotlib
+fastdtw
+scipy
+scikit-learn
