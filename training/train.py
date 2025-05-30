@@ -1,106 +1,103 @@
+# train.py
+import os
 import torch
-from training.evaluate import evaluate_model
-from loss import MultiTaskUncertaintyLoss
-# 注意: MultiTaskUncertaintyLoss、evaluate_model 等自定义模块需在其他处定义或导入
+from torch.utils.tensorboard import SummaryWriter
+from training.evaluate import evaluate
+from training.loss import compute_loss
 
-def train(train_loader, val_loader, model, num_epochs=100, learning_rate=1e-4,
-          patience=10, scheduler_patience=5, weight_decay=0):
+def train(model, train_loader, val_loader, optimizer, log_dir='logs/', epochs=100, patience=10):
     """
-    训练多任务模型，支持同时进行分类和回归任务。
-    
-    参数:
-        train_loader: 训练数据加载器 (每个 batch 返回 inputs, cls_labels, reg_labels)
-        val_loader: 验证数据加载器 (格式同上)
-        model: PyTorch 模型，应输出分类预测和回归预测 (返回 (cls_output, reg_output))
-        num_epochs: 最大训练轮数
-        learning_rate: 学习率 (Adam 优化器)
-        patience: EarlyStopping 的耐心值 (验证集 loss 持续不下降时提前终止)
-        scheduler_patience: ReduceLROnPlateau 调度器的耐心值
-        weight_decay: 权重衰减 (L2)
-    返回:
-        best_model_path: 保存的最佳模型权重文件路径
-        history: 训练日志列表 (每轮 epoch 的指标字典)
+    模型训练函数，包含训练循环、验证评估、早停机制和TensorBoard记录。
+    参数：
+        model: 多任务模型实例
+        train_loader: 训练集的DataLoader
+        val_loader: 验证集的DataLoader
+        optimizer: 优化器（如Adam）
+        log_dir: TensorBoard日志输出目录
+        epochs: 最大训练轮数
+        patience: 验证集无改进的早停轮数
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model = model.to(device)
 
-    criterion = MultiTaskUncertaintyLoss()  # 不确定性加权损失
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=scheduler_patience)
+    writer = SummaryWriter(log_dir=log_dir)  # 初始化TensorBoard记录器
+    best_val_loss = float('inf')
+    best_model_wts = None
+    epochs_no_improve = 0
 
-    best_loss = float('inf')
-    early_stop_counter = 0
-    best_model_path = "best_model.pt"
-    history = []
-
-    for epoch in range(1, num_epochs+1):
+    for epoch in range(epochs):
         model.train()
-        train_loss = 0.0
-        # 训练一个 epoch
-        for inputs, cls_labels, reg_labels in train_loader:
-            inputs, cls_labels, reg_labels = inputs.to(device), cls_labels.to(device), reg_labels.to(device)
+        running_loss = 0.0
+        total_samples = 0
+
+        for X, y_class, y_reg in train_loader:
+            X = X.to(device)
+            y_class = y_class.to(device)
+            y_reg = y_reg.to(device)
 
             optimizer.zero_grad()
-            cls_output, reg_output = model(inputs)
-            loss = criterion(cls_output, cls_labels, reg_output, reg_labels)
+            outputs = model(X)
+            # 计算损失
+            loss, class_loss, reg_loss = compute_loss(outputs, (y_class, y_reg))
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
-        train_loss /= len(train_loader)
 
-        # 验证集评估
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for inputs, cls_labels, reg_labels in val_loader:
-                inputs, cls_labels, reg_labels = inputs.to(device), cls_labels.to(device), reg_labels.to(device)
-                cls_output, reg_output = model(inputs)
-                loss = criterion(cls_output, cls_labels, reg_output, reg_labels)
-                val_loss += loss.item()
-        val_loss /= len(val_loader)
+            batch_size = X.size(0)
+            running_loss += loss.item() * batch_size
+            total_samples += batch_size
 
-        # 计算验证集上的分类和回归指标
-        eval_metrics = evaluate_model(model, val_loader, device)
-        accuracy = eval_metrics.get('accuracy', 0.0)
-        precision = eval_metrics.get('precision', 0.0)
-        recall = eval_metrics.get('recall', 0.0)
-        f1 = eval_metrics.get('f1', 0.0)
-        mse = eval_metrics.get('mse', 0.0)
-        mae = eval_metrics.get('mae', 0.0)
-        dtw = eval_metrics.get('dtw', 0.0)
+        avg_train_loss = running_loss / total_samples
 
-        # 打印当前 epoch 的训练/验证损失和指标
-        print(f"Epoch {epoch}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f} | "
-              f"Acc={accuracy:.4f}, Prec={precision:.4f}, Rec={recall:.4f}, F1={f1:.4f} | "
-              f"MSE={mse:.4f}, MAE={mae:.4f}, DTW={dtw:.4f}")
+        # 在验证集上评估
+        metrics = evaluate(model, val_loader)
+        val_total_loss = metrics['loss_total']
+        val_class_loss = metrics['loss_class']
+        val_reg_loss   = metrics['loss_reg']
+        val_acc        = metrics['accuracy']
+        val_prec      = metrics['precision']
+        val_rec       = metrics['recall']
+        val_f1        = metrics['f1_score']
+        val_mse        = metrics['mse']
+        val_mae        = metrics['mae']
+        val_dtw       = metrics['dtw']
+        
+        # 打印日志
+        print(f"Epoch {epoch+1}/{epochs}: "
+              f"Train Loss={avg_train_loss:.4f}, "
+              f"Val Loss={val_total_loss:.4f} "
+              f"(Class={val_class_loss:.4f}, Reg={val_reg_loss:.4f}), "
+              f"Acc={val_acc*100:.2f}%, "
+              f"Prec={val_prec:.4f}, Rec={val_rec:.4f}, F1={val_f1:.4f}, "
+              f"MSE={val_mse:.4f}, MAE={val_mae:.4f}, DTW={val_dtw:.4f}")
 
-        # 更新学习率调度器
-        scheduler.step(val_loss)
+        # 写入TensorBoard
+        writer.add_scalar("Loss/Train", avg_train_loss, epoch)
+        writer.add_scalar("Loss/Val_Total", val_total_loss, epoch)
+        writer.add_scalar("Loss/Val_Classification", val_class_loss, epoch)
+        writer.add_scalar("Loss/Val_Regression", val_reg_loss, epoch)
+        writer.add_scalar("Metrics/Val_Accuracy", val_acc, epoch)
+        writer.add_scalar("Metrics/Val_MSE", val_mse, epoch)
+        writer.add_scalar("Metrics/Val_MAE", val_mae, epoch)
+        writer.add_scalar("Metrics/Val_Precision",   val_prec, epoch)
+        writer.add_scalar("Metrics/Val_Recall",      val_rec, epoch)
+        writer.add_scalar("Metrics/Val_F1",          val_f1, epoch)
+        writer.add_scalar("Metrics/Val_DTW",         val_dtw, epoch)
 
-        # 记录日志
-        history.append({
-            'epoch': epoch,
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'mse': mse,
-            'mae': mae,
-            'dtw': dtw
-        })
-
-        # 检查是否为最佳模型
-        if val_loss < best_loss:
-            best_loss = val_loss
-            early_stop_counter = 0
-            torch.save(model.state_dict(), best_model_path)
+        # 检查是否为当前最佳
+        if val_total_loss < best_val_loss:
+            best_val_loss = val_total_loss
+            best_model_wts = {name: param.clone() for name, param in model.state_dict().items()}
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), os.path.join(log_dir, "best_model.pth"))  # 保存最优模型
         else:
-            early_stop_counter += 1
-            if early_stop_counter >= patience:
-                print(f"Early stopping: validation loss has not improved for {patience} epochs.")
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"验证集{patience}个epoch无改进，提前停止训练。")
                 break
 
-    return best_model_path, history
+    writer.close()
+
+    if best_model_wts:
+        model.load_state_dict(best_model_wts)
+        print("已加载验证集上表现最好的模型权重")
+    return model

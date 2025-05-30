@@ -1,103 +1,81 @@
-import argparse
+# main.py
 import os
 import torch
-import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
+import torch.optim as optim 
+import argparse
+import logging
+from torch.utils.data import DataLoader
+from models.model import MultiTaskModel
+from training.train import train
+from training.evaluate import evaluate
 from bearing_dataset import BearingDataset
-from models import MultiTaskModel
-from training import train, evaluate_model
 
-def parse_args():
-    """
-    解析命令行参数。
-    :return: 解析后的参数
-    """
-    parser = argparse.ArgumentParser(description='Train a multi-task Transformer model on bearing data.')
-    parser.add_argument('--data_dir', type=str, default='dataset/Data/matfiles', help='数据目录')
-    parser.add_argument('--out_dir', type=str, default='output', help='输出目录')
-    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
-    parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Multi-Task Bearing Fault Diagnosis")
+    parser.add_argument('--mode', type=str, choices=['train', 'eval'], default='train',
+                        help="运行模式：'train' 执行训练流程；'eval' 仅加载最优模型并评估")
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
-    parser.add_argument('--patience', type=int, default=10, help='早停耐心值')
-    parser.add_argument('--scheduler_patience', type=int, default=5, help='学习率调度耐心值')
-    parser.add_argument('--weight_decay', type=float, default=0, help='权重衰减')
-    return parser.parse_args()
+    parser.add_argument('--batch_size', type=int, default=32, help='批大小')
+    parser.add_argument('--learning_rate', type=float, default=0.001, help='学习率')
+    parser.add_argument('--data_dir', type=str, default='.', help='.joblib 数据文件所在目录')
+    parser.add_argument('--log_dir', type=str, default='logs/', help='日志及模型存储目录')
+    args = parser.parse_args()
 
-def main():
-    """
-    主函数，执行数据加载、模型训练和评估。
-    """
-    args = parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    # 加载数据集
-    files = [
-        f'{args.data_dir}/0_0.mat',
-        f'{args.data_dir}/7_1.mat',
-        f'{args.data_dir}/7_2.mat',
-        f'{args.data_dir}/7_3.mat',
-        f'{args.data_dir}/14_1.mat',
-        f'{args.data_dir}/14_2.mat',
-        f'{args.data_dir}/14_3.mat',
-        f'{args.data_dir}/21_1.mat',
-        f'{args.data_dir}/21_2.mat',
-        f'{args.data_dir}/21_3.mat',
-    ]
-    dataset = BearingDataset(files, Lhist=1024, Lpred=1024, step=512)
-    X, Y_pred, y, file_indices = dataset.load_data()
-
-    # 分层划分数据集
-    train_idx, temp_idx = train_test_split(
-        np.arange(len(X)),
-        test_size=0.4,  # 40% 用于验证+测试
-        stratify=file_indices,
-        random_state=42
-    )
-    val_idx, test_idx = train_test_split(
-        temp_idx,
-        test_size=0.5,  # 临时集的一半，即20%
-        stratify=file_indices[temp_idx],
-        random_state=42
+    # 创建日志目录
+    os.makedirs(args.log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(args.log_dir, 'main.log'), mode='w'),
+            logging.StreamHandler()
+        ]
     )
 
-    # 创建子集
-    train_X, train_Y_pred, train_y = X[train_idx], Y_pred[train_idx], y[train_idx]
-    val_X, val_Y_pred, val_y = X[val_idx], Y_pred[val_idx], y[val_idx]
-    test_X, test_Y_pred, test_y = X[test_idx], Y_pred[test_idx], y[test_idx]
-
-    # 转换为 TensorDataset
-    train_dataset = TensorDataset(
-        torch.from_numpy(train_X).float().unsqueeze(1),
-        torch.from_numpy(train_y).long(),
-        torch.from_numpy(train_Y_pred).float()
+    # 准备 DataLoader：
+    train_loader = DataLoader(
+        BearingDataset(data_dir=args.data_dir, split='train'),
+        batch_size=args.batch_size, shuffle=True
     )
-    val_dataset = TensorDataset(
-        torch.from_numpy(val_X).float().unsqueeze(1),
-        torch.from_numpy(val_y).long(),
-        torch.from_numpy(val_Y_pred).float()
+    val_loader = DataLoader(
+        BearingDataset(data_dir=args.data_dir, split='val'),
+        batch_size=args.batch_size, shuffle=False
     )
-    test_dataset = TensorDataset(
-        torch.from_numpy(test_X).float().unsqueeze(1),
-        torch.from_numpy(test_y).long(),
-        torch.from_numpy(test_Y_pred).float()
+    test_loader = DataLoader(
+        BearingDataset(data_dir=args.data_dir, split='test'),
+        batch_size=args.batch_size, shuffle=False
     )
-
-    # 创建 DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-
-    # 构建模型
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiTaskModel(
-        in_channels=1,
-        embed_dim=128,
-        kernel_sizes=(3, 5, 9),
-        num_layers=4,
-        num_heads=8,
-        dim_feedforward=256,
-        local_window_size=5
-    ).to(device)
-    print("模型结构:", model)
     
+
+    # 设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 实例化模型
+    model = MultiTaskModel().to(device)
+
+    if args.mode == 'train':
+        # ----------------- 训练 + 测试评估 -----------------
+        logging.info("开始训练 …")
+        best_model = train(
+            model, train_loader, val_loader,
+            optimizer=optim.Adam(model.parameters(), lr=args.learning_rate),
+            # TensorBoard 日志目录
+            log_dir=args.log_dir,
+            epochs=args.epochs,
+            patience=20
+        )
+        logging.info("训练完毕，开始测试集评估 …")
+        test_metrics = evaluate(best_model, test_loader)
+        logging.info(f"Test结果：{test_metrics}")
+        # 最优模型已在 train() 中存储于 logs/best_model.pth
+    else:
+        # ----------------- 仅评估 -----------------
+        ckpt = os.path.join(args.log_dir, "best_model.pth")
+        logging.info(f"加载最优模型权重：{ckpt}")
+        model.load_state_dict(torch.load(ckpt, map_location=device))
+        model.eval()
+        logging.info("开始在测试集上评估 …")
+        test_metrics = evaluate(model, test_loader)
+        logging.info(f"Test结果：{test_metrics}")
+
+    logging.info("流程结束。")

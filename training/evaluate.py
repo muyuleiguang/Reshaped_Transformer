@@ -1,154 +1,105 @@
-import time
-import os
-import matplotlib.pyplot as plt
+# evaluate.py
+
 import torch
-import numpy as np
+from training.loss import compute_loss
 from metrics.metrics import (
-    classification_metrics, regression_metrics, average_dtw
+    classification_accuracy,
+    classification_precision,
+    classification_recall,
+    classification_f1,
+    mean_squared_error_metric,
+    mean_absolute_error_metric,
+    dynamic_time_warping
 )
 
-def evaluate_model(model, dataloader, device, log_dir=None, plot_examples=3):
+def evaluate(model, data_loader):
     """
-    在验证/测试集上评估模型，并可选地记录日志、绘制对比图。
-    - log_dir: 如果不为 None，会把指标写入 log_dir/metrics.txt，并保存示例图
-    - plot_examples: 从数据集中抽几个样本画 真值 vs 预测图
-    Returns dict of metrics.
+    在验证集或测试集上评估多任务模型的性能，返回包含损失和多种指标的字典。
+    Args:
+        model: 训练好的多任务模型
+        data_loader: torch.utils.data.DataLoader，提供 (X, y_class, y_reg) 批次
+    Returns:
+        dict 包含键：
+            'loss_total'：总损失（分类+回归）
+            'loss_class'：分类损失
+            'loss_reg'： 回归损失
+            'accuracy'：分类准确率
+            'precision'：分类精确率（Macro）
+            'recall'：分类召回率（Macro）
+            'f1_score'：分类 F1 分数（Macro）
+            'mse'：回归均方误差
+            'mae'：回归平均绝对误差
+            'dtw'： 预测序列与真实序列的 DTW 距离
     """
-    model.eval()
-    all_cls_pred, all_cls_true = [], []
-    all_reg_pred, all_reg_true = [], []
+    model.eval()  # 切换到评估模式（关闭 dropout 等）
+    device = next(model.parameters()).device  # 获取模型所在设备
 
-    start_time = time.time()
-    with torch.no_grad():
-        for X, y_cls, y_reg in dataloader:
-            X = X.to(device)
-            cls_logits, y_pred_reg = model(X)
-            cls_pred = torch.argmax(cls_logits, dim=-1).cpu().numpy()
+    # 以下用于累计损失和样本数量
+    total_class_loss = 0
+    total_reg_loss   = 0
+    total_samples    = 0
 
-            all_cls_true.append(y_cls.numpy())
-            all_cls_pred.append(cls_pred)
-            all_reg_true.append(y_reg.numpy())
-            all_reg_pred.append(y_pred_reg.cpu().numpy())
-    elapsed = time.time() - start_time
+    # 以下列表用于收集所有批次的预测和真实值，以计算指标
+    all_pred_labels = []
+    all_true_labels = []
+    all_pred_regs   = []
+    all_true_regs   = []
 
-    # 合并
-    all_cls_true = np.concatenate(all_cls_true, axis=0)
-    all_cls_pred = np.concatenate(all_cls_pred, axis=0)
-    all_reg_true = np.vstack(all_reg_true)
-    all_reg_pred = np.vstack(all_reg_pred)
+    with torch.no_grad():  # 评估时不计算梯度
+        for X, y_class, y_reg in data_loader:
+            # 将数据移动到同一设备
+            X, y_class, y_reg = X.to(device), y_class.to(device), y_reg.to(device)
 
-    # 计算指标
-    cls_m = classification_metrics(all_cls_true, all_cls_pred)
-    reg_m = regression_metrics(all_reg_true, all_reg_pred)
-    dtw = average_dtw(all_reg_true, all_reg_pred)
+            # 模型前向，outputs=(class_logits, reg_out)
+            outputs = model(X)
 
-    results = {
-        'cls_accuracy': cls_m['accuracy'],
-        'cls_precision': cls_m['precision'],
-        'cls_recall': cls_m['recall'],
-        'cls_f1': cls_m['f1'],
-        'reg_mse': reg_m['mse'],
-        'reg_mae': reg_m['mae'],
-        'reg_dtw': dtw,
-        'eval_time_s': elapsed
+            # 调用统一的损失计算接口，返回 (total_loss, class_loss, reg_loss)
+            _, class_loss, reg_loss = compute_loss(outputs, (y_class, y_reg))
+
+            batch = X.size(0)
+            total_class_loss += class_loss.item() * batch
+            total_reg_loss   += reg_loss.item()   * batch
+            total_samples    += batch
+
+            # 拆分分类和回归输出
+            class_logits, reg_out = outputs
+
+            # 分类：取 argmax 得到标签预测
+            preds = class_logits.argmax(dim=1)
+            all_pred_labels.extend(preds.cpu().tolist())
+            all_true_labels.extend(y_class.cpu().tolist())
+
+            # 回归：将 reg_out 展平后收集
+            all_pred_regs.extend(reg_out.view(-1).cpu().tolist())
+            flat_true = y_reg.reshape(-1).cpu().tolist()
+            all_true_regs.extend(flat_true)
+
+    # 计算平均损失
+    avg_class_loss = total_class_loss / total_samples
+    avg_reg_loss   = total_reg_loss   / total_samples
+    avg_total_loss = avg_class_loss + avg_reg_loss
+
+    # 计算分类指标
+    accuracy  = classification_accuracy(all_pred_labels, all_true_labels)
+    precision = classification_precision(all_pred_labels, all_true_labels)
+    recall    = classification_recall(all_pred_labels, all_true_labels)
+    f1_score  = classification_f1(all_pred_labels, all_true_labels)
+
+    # 计算回归指标
+    mse      = mean_squared_error_metric(all_pred_regs, all_true_regs)
+    mae      = mean_absolute_error_metric(all_pred_regs, all_true_regs)
+    dtw_dist = dynamic_time_warping(all_pred_regs, all_true_regs)
+
+    # 返回一个包含所有指标的字典
+    return {
+        'loss_total': avg_total_loss,
+        'loss_class': avg_class_loss,
+        'loss_reg':   avg_reg_loss,
+        'accuracy':   accuracy,
+        'precision':  precision,
+        'recall':     recall,
+        'f1_score':   f1_score,
+        'mse':        mse,
+        'mae':        mae,
+        'dtw':        dtw_dist
     }
-
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-        # 写指标到 txt
-        with open(os.path.join(log_dir, 'metrics.txt'), 'a') as f:
-            f.write(time.asctime() + '\n')
-            for k, v in results.items():
-                f.write(f"{k}: {v}\n")
-            f.write('\n')
-
-        # 绘制部分示例对比图
-        for i in range(min(plot_examples, len(all_reg_true))):
-            plt.figure(figsize=(6,3))
-            plt.plot(all_reg_true[i], label='True')
-            plt.plot(all_reg_pred[i], label='Pred')
-            plt.legend()
-            plt.title(f"Sample {i} True vs Pred")
-            plt.tight_layout()
-            plt.savefig(os.path.join(log_dir, f"sample_{i}.png"))
-            plt.close()
-
-    return results
-# training/evaluate.py
-
-import time
-import os
-import matplotlib.pyplot as plt
-import torch
-import numpy as np
-from metrics.metrics import (
-    classification_metrics, regression_metrics, average_dtw
-)
-
-def evaluate_model(model, dataloader, device, log_dir=None, plot_examples=3):
-    """
-    在验证/测试集上评估模型，并可选地记录日志、绘制对比图。
-    - log_dir: 如果不为 None，会把指标写入 log_dir/metrics.txt，并保存示例图
-    - plot_examples: 从数据集中抽几个样本画 真值 vs 预测图
-    Returns dict of metrics.
-    """
-    model.eval()
-    all_cls_pred, all_cls_true = [], []
-    all_reg_pred, all_reg_true = [], []
-
-    start_time = time.time()
-    with torch.no_grad():
-        for X, y_cls, y_reg in dataloader:
-            X = X.to(device)
-            cls_logits, y_pred_reg = model(X)
-            cls_pred = torch.argmax(cls_logits, dim=-1).cpu().numpy()
-
-            all_cls_true.append(y_cls.numpy())
-            all_cls_pred.append(cls_pred)
-            all_reg_true.append(y_reg.numpy())
-            all_reg_pred.append(y_pred_reg.cpu().numpy())
-    elapsed = time.time() - start_time
-
-    # 合并
-    all_cls_true = np.concatenate(all_cls_true, axis=0)
-    all_cls_pred = np.concatenate(all_cls_pred, axis=0)
-    all_reg_true = np.vstack(all_reg_true)
-    all_reg_pred = np.vstack(all_reg_pred)
-
-    # 计算指标
-    cls_m = classification_metrics(all_cls_true, all_cls_pred)
-    reg_m = regression_metrics(all_reg_true, all_reg_pred)
-    dtw = average_dtw(all_reg_true, all_reg_pred)
-
-    results = {
-        'cls_accuracy': cls_m['accuracy'],
-        'cls_precision': cls_m['precision'],
-        'cls_recall': cls_m['recall'],
-        'cls_f1': cls_m['f1'],
-        'reg_mse': reg_m['mse'],
-        'reg_mae': reg_m['mae'],
-        'reg_dtw': dtw,
-        'eval_time_s': elapsed
-    }
-
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-        # 写指标到 txt
-        with open(os.path.join(log_dir, 'metrics.txt'), 'a') as f:
-            f.write(time.asctime() + '\n')
-            for k, v in results.items():
-                f.write(f"{k}: {v}\n")
-            f.write('\n')
-
-        # 绘制部分示例对比图
-        for i in range(min(plot_examples, len(all_reg_true))):
-            plt.figure(figsize=(6,3))
-            plt.plot(all_reg_true[i], label='True')
-            plt.plot(all_reg_pred[i], label='Pred')
-            plt.legend()
-            plt.title(f"Sample {i} True vs Pred")
-            plt.tight_layout()
-            plt.savefig(os.path.join(log_dir, f"sample_{i}.png"))
-            plt.close()
-
-    return results
