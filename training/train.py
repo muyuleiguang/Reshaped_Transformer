@@ -8,6 +8,7 @@ from training.loss import compute_loss
 def train(model, train_loader, val_loader, optimizer, log_dir='logs/', epochs=100, patience=10):
     """
     模型训练函数，包含训练循环、验证评估、早停机制和TensorBoard记录。
+    现将“最优模型”准则从“验证集总损失最小”改为“验证集准确率最高”。
     参数：
         model: 多任务模型实例
         train_loader: 训练集的DataLoader
@@ -21,7 +22,9 @@ def train(model, train_loader, val_loader, optimizer, log_dir='logs/', epochs=10
     model = model.to(device)
 
     writer = SummaryWriter(log_dir=log_dir)  # 初始化TensorBoard记录器
-    best_val_loss = float('inf')
+
+    # === 修改1：用 best_val_acc 取代 best_val_loss，并初始化为极小值（0.0） ===
+    best_val_acc = 0.0
     best_model_wts = None
     epochs_no_improve = 0
 
@@ -50,16 +53,17 @@ def train(model, train_loader, val_loader, optimizer, log_dir='logs/', epochs=10
 
         # 在验证集上评估
         metrics = evaluate(model, val_loader)
+        # 从 evaluate 返回值中提取各项指标
         val_total_loss = metrics['loss_total']
         val_class_loss = metrics['loss_class']
         val_reg_loss   = metrics['loss_reg']
         val_acc        = metrics['accuracy']
-        val_prec      = metrics['precision']
-        val_rec       = metrics['recall']
-        val_f1        = metrics['f1_score']
+        val_prec       = metrics['precision']
+        val_rec        = metrics['recall']
+        val_f1         = metrics['f1_score']
         val_mse        = metrics['mse']
         val_mae        = metrics['mae']
-        val_dtw       = metrics['dtw']
+        val_dtw        = metrics['dtw']
         
         # 打印日志
         print(f"Epoch {epoch+1}/{epochs}: "
@@ -78,26 +82,28 @@ def train(model, train_loader, val_loader, optimizer, log_dir='logs/', epochs=10
         writer.add_scalar("Metrics/Val_Accuracy", val_acc, epoch)
         writer.add_scalar("Metrics/Val_MSE", val_mse, epoch)
         writer.add_scalar("Metrics/Val_MAE", val_mae, epoch)
-        writer.add_scalar("Metrics/Val_Precision",   val_prec, epoch)
-        writer.add_scalar("Metrics/Val_Recall",      val_rec, epoch)
-        writer.add_scalar("Metrics/Val_F1",          val_f1, epoch)
-        writer.add_scalar("Metrics/Val_DTW",         val_dtw, epoch)
+        writer.add_scalar("Metrics/Val_Precision", val_prec, epoch)
+        writer.add_scalar("Metrics/Val_Recall", val_rec, epoch)
+        writer.add_scalar("Metrics/Val_F1", val_f1, epoch)
+        writer.add_scalar("Metrics/Val_DTW", val_dtw, epoch)
 
-        # 检查是否为当前最佳
-        if val_total_loss < best_val_loss:
-            best_val_loss = val_total_loss
+        # === 修改2：判断当前 val_acc 是否优于 best_val_acc ===
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            # 保存当时最好的模型权重
             best_model_wts = {name: param.clone() for name, param in model.state_dict().items()}
             epochs_no_improve = 0
-            torch.save(model.state_dict(), os.path.join(log_dir, "best_model.pth"))  # 保存最优模型
+            torch.save(model.state_dict(), os.path.join(log_dir, "best_model.pth"))
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                print(f"验证集{patience}个epoch无改进，提前停止训练。")
+                print(f"验证集准确率 {patience} 个 epoch 无改进，提前停止训练。")
                 break
 
     writer.close()
 
+    # === 修改3：加载“最佳准确率”模型权重 ===
     if best_model_wts:
         model.load_state_dict(best_model_wts)
-        print("已加载验证集上表现最好的模型权重")
+        print("已加载验证集上准确率最高的模型权重")
     return model

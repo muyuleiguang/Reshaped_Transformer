@@ -16,8 +16,8 @@ if __name__ == "__main__":
     parser.add_argument('--mode', type=str, choices=['train', 'eval'], default='train',
                         help="运行模式：'train' 执行训练流程；'eval' 仅加载最优模型并评估")
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=32, help='批大小')
-    parser.add_argument('--learning_rate', type=float, default=0.001, help='学习率')
+    parser.add_argument('--batch_size', type=int, default=16, help='批大小')
+    parser.add_argument('--learning_rate', type=float, default=0.0005, help='学习率')
     parser.add_argument('--data_dir', type=str, default='.', help='.joblib 数据文件所在目录')
     parser.add_argument('--log_dir', type=str, default='logs/', help='日志及模型存储目录')
     args = parser.parse_args()
