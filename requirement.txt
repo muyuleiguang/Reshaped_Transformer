@@ -2,7 +2,7 @@
 torch==2.5.1+cu124
 torchvision==0.20.1+cu124
 torchaudio==2.5.1+cu124
-triton==3.2.0         # PyTorch JIT 后端
+triton==3.1.0         # PyTorch JIT 后端
 transformers==4.41.0
 accelerate==1.4.0
 peft==0.11.1
